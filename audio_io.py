@@ -11,7 +11,7 @@ class AudioSignal(SoundFile):
     def __init__(self, filename):
         self.filename = filename
         self.filename_check()
-        super(SoundFile, self).__init__(filename)
+        super(AudioSignal, self).__init__(filename)
 
     def filename_check(self):
         if self.filename is None:
