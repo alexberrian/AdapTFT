@@ -151,7 +151,6 @@ class TFTransformer(object):
             final_block = self.AudioSignal.read()  # Read the rest of the file from there
             final_block = final_block.T
             final_frames = final_block.shape[0]
-            print(final_frames)
             if final_frames >= windowsize:
                 raise ValueError("You shouldn't have final_frames {} "
                                  "greater than windowsize {}".format(final_frames, windowsize))
