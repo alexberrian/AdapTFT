@@ -87,7 +87,18 @@ class TFTransformer(object):
                            "compute_qstft":            False,
                           }
 
-    def compute_stft(self) -> np.ndarray:
+    def compute_stft(self):
+        """
+        Computes STFT and returns it as a generator with each STFT frame.
+        Allows for support of boundary frames.
+
+        TBD:
+        - Proper boundary treatment to ensure perfect reconstruction
+        - Option for stereo->mono for computation
+        - Testing for stereo signals
+
+        :yield: Generator, each is an STFT frame.
+        """
         windowmode = self.param_dict["windowmode"]
         if windowmode != "single":
             raise ValueError("windowmode must be 'single' for STFT, "
@@ -107,21 +118,18 @@ class TFTransformer(object):
         if buffermode == "centered_analysis":
             initial_block = self.AudioSignal.read(frames=windowsize)
             initial_block = initial_block.T
-            stft = []
             # Pad the boundary with reflected audio frames,
             # then add boundary STFT frames to the STFT
             frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
                 reflect_block = pad_boundary_rows(initial_block[frame0:], windowsize, 'left')
-                stft.append(self.wft(reflect_block, window, fftsize))
+                yield self.wft(reflect_block, window, fftsize)
                 frame0 += hopsize
         elif buffermode == "reconstruction":
             pass  # FILL THIS IN
             frame0 = 0
-            stft = []
         elif buffermode == "valid_analysis":
             frame0 = 0
-            stft = []
         else:
             raise ValueError("Invalid buffermode {}".format(buffermode))
 
@@ -140,9 +148,8 @@ class TFTransformer(object):
                                               frames=num_audio_frames_full_stft)
         for block in blockreader:
             block = block.T  # First transpose to get each channel as a row
-            stft.append(self.wft(block, window, fftsize))
+            yield self.wft(block, window, fftsize)
             frame0 += hopsize
-        # BUT what happens to the seek position after going through all those blocks?
 
         # Now treat the right boundary
         if buffermode == "centered_analysis":
@@ -160,7 +167,7 @@ class TFTransformer(object):
             halfwindowsize = (windowsize // 2)  # Floored if odd
             while final_frames - frame1 >= halfwindowsize:
                 reflect_block = pad_boundary_rows(final_block[frame1:], windowsize, 'right')
-                stft.append(self.wft(reflect_block, window, fftsize))
+                yield self.wft(reflect_block, window, fftsize)
                 frame1 += hopsize
         elif buffermode == "reconstruction":
             pass  # FILL THIS IN
@@ -169,8 +176,6 @@ class TFTransformer(object):
             pass
         else:
             raise ValueError("Invalid buffermode {}".format(buffermode))
-
-        return np.asarray(stft)
 
     def compute_sst(self):
         windowmode = self.param_dict["windowmode"]
