@@ -73,13 +73,13 @@ class TFTransformer(object):
         self.initialize_default_params()
 
     def initialize_default_params(self):
-        self.param_dict = {"hopsize":                    256,
+        self.param_dict = {"hopsize":                    256,  # Test with 215
                            "windowfunc":          np.hanning,
                            "windowmode":            "single",
-                           "windowsize":                4096,
+                           "windowsize":                4096,  # Test with 4095
                            "fftsize":                   4096,
                            "buffermode": "centered_analysis",
-                           "sstsize":                   6000,
+                           "sstsize":                   6000,  # Test with 6007
                            "realfft":                   True,
                            "compute_stft":              True,
                            "compute_sst":              False,
@@ -100,7 +100,7 @@ class TFTransformer(object):
         windowfunc = self.param_dict["windowfunc"]
         buffermode = self.param_dict["buffermode"]
         overlap = windowsize - hopsize
-        window = windowfunc[windowsize]
+        window = windowfunc(windowsize)
 
         # Initialize the stft
         # This should be a separate function
@@ -108,8 +108,9 @@ class TFTransformer(object):
             initial_block = self.AudioSignal.read(frames=windowsize)
             initial_block = initial_block.T
             stft = []
-            # Pad the boundary then add boundary frames to STFT
-            frame0 = -windowsize // 2
+            # Pad the boundary with reflected audio frames,
+            # then add boundary STFT frames to the STFT
+            frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
                 reflect_block = pad_boundary_rows(initial_block[frame0:], windowsize, 'left')
                 stft.append(self.wft(reflect_block, window, fftsize))
@@ -124,11 +125,52 @@ class TFTransformer(object):
         else:
             raise ValueError("Invalid buffermode {}".format(buffermode))
 
-        self.AudioSignal.seek(frame0)  # Go back to frame0 and now make blocks
-        blockreader = self.AudioSignal.blocks(blocksize=windowsize, overlap=overlap)
+        # Get the number of audio frames, and seek to the audio frame given by frame0
+        num_audio_frames = self.AudioSignal.get_num_frames_from_and_seek_start(start_frame=frame0)
+
+        # Now calculate the max number of FULL non-boundary STFT frames,
+        # considering hop size and window size.
+        num_full_stft_frames = 1 + ((num_audio_frames - windowsize) // hopsize)
+
+        # Convert that to the number of audio frames that you'll analyze for non-boundary STFT.
+        num_audio_frames_full_stft = (num_full_stft_frames - 1) * hopsize + windowsize
+
+        # Feed blocks to create the non-boundary STFT frames
+        blockreader = self.AudioSignal.blocks(blocksize=windowsize, overlap=overlap,
+                                              frames=num_audio_frames_full_stft)
         for block in blockreader:
             block = block.T  # First transpose to get each channel as a row
             stft.append(self.wft(block, window, fftsize))
+            frame0 += hopsize
+        # BUT what happens to the seek position after going through all those blocks?
+
+        # Now treat the right boundary
+        if buffermode == "centered_analysis":
+            # Need to read from frame0
+            self.AudioSignal.seek(frames=frame0)
+            final_block = self.AudioSignal.read()  # Read the rest of the file from there
+            final_block = final_block.T
+            final_frames = final_block.shape[0]
+            print(final_frames)
+            if final_frames >= windowsize:
+                raise ValueError("You shouldn't have final_frames {} "
+                                 "greater than windowsize {}".format(final_frames, windowsize))
+            # Pad the boundary with reflected audio frames,
+            # then add boundary STFT frames to the STFT
+            frame1 = 0
+            halfwindowsize = (windowsize // 2)  # Floored if odd
+            while final_frames - frame1 >= halfwindowsize:
+                reflect_block = pad_boundary_rows(final_block[frame1:], windowsize, 'right')
+                stft.append(self.wft(reflect_block, window, fftsize))
+                frame1 += hopsize
+        elif buffermode == "reconstruction":
+            pass  # FILL THIS IN
+            frame1 = 0
+        elif buffermode == "valid_analysis":  # Do nothing at this point
+            pass
+        else:
+            raise ValueError("Invalid buffermode {}".format(buffermode))
+
         return np.asarray(stft)
 
     def compute_sst(self):

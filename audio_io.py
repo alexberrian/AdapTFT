@@ -21,3 +21,12 @@ class AudioSignal(SoundFile):
         elif not os.path.isfile(self.filename):
             raise IOError("Filename {} is not a valid file (is it a folder?)".format(self.filename))
 
+    def get_num_frames_from_and_seek_start(self, start_frame=0, end_frame=None):
+        """
+        Get the number of audio frames from start_frame to end_frame (latter is optional)
+        and change the seek position in the audio file to start_frame.
+        :param start_frame: int, where you intend to move the seek position to
+        :param end_frame: int or None, final frame up to which you want to calculate number of frames
+        :return: num_frames: number of frames between start_frame and end_frame or end of signal
+        """
+        return self._prepare_read(start=start_frame, stop=end_frame, frames=-1)
