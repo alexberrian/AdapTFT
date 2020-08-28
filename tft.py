@@ -1,68 +1,7 @@
 import numpy as np
 from audio_io import AudioSignal
 #from typing import Callable
-
-
-def pad_boundary_rows(input_array: np.ndarray, finalsize: int, side: str) -> np.ndarray:
-    """
-    Pad each channel of a buffer, where channels are assumed to be in rows.
-    Padding happens at the boundary, by even reflection.
-
-    :param input_array: array to be padded by reflection
-    :param finalsize: finalsize: final size of the array (example: window size)
-    :param side: "left" or "right" to do the padding.
-                 i.e., if "left", then padding is done to the left of the input array.
-    :return: output_array: reflection-padded array
-    """
-    inputsize = input_array.shape[0]
-    padsize = finalsize - inputsize
-    if side == "left":
-        padsize_left = padsize
-        padsize_right = 0
-    elif side == "right":
-        padsize_left = 0
-        padsize_right = padsize
-    else:
-        raise ValueError("Pad side {} to pad_boundary_rows is invalid, "
-                         "must be 'left' or 'right'".format(side))
-
-    if len(input_array.shape) == 2:
-        output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='reflect')
-    elif len(input_array.shape) == 1:
-        output_array = np.pad(input_array, (padsize_left, padsize_right), mode='reflect')
-    else:
-        raise ValueError("input array to pad_boundary_rows has dimensions {}, "
-                         "which is not supported".format(input_array.shape))
-
-    return output_array
-
-
-def zeropad_rows(input_array: np.ndarray, finalsize: int) -> np.ndarray:
-    """
-    Zeropad each channel of a buffer, where channels are assumed to be in rows.
-    Padding happens with the input array centered, and zeros padded equally on left and right,
-    unless finalsize minus inputsize is odd.
-    This is used for preparing a windowed array to be sent to an FFT.
-
-    :param input_array: array to be padded with zeros
-    :param finalsize: final size of the array (example: FFT size)
-    :return: output_array: zero-padded array
-    """
-    inputsize = input_array.shape[0]
-
-    padsize = finalsize - inputsize
-    padsize_left = padsize // 2
-    padsize_right = padsize - padsize_left
-
-    if len(input_array.shape) == 2:
-        output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='constant')
-    elif len(input_array.shape) == 1:
-        output_array = np.pad(input_array, (padsize_left, padsize_right), mode='constant')
-    else:
-        raise ValueError("input array to zeropad_rows has dimensions {}, "
-                         "which is not supported".format(input_array.shape))
-
-    return output_array
+#from typing import Generator
 
 
 class TFTransformer(object):
@@ -97,7 +36,7 @@ class TFTransformer(object):
         - Option for stereo->mono for computation
         - Testing for stereo signals
 
-        :yield: Generator, each is an STFT frame.
+        :yield: Generator, each instance is an STFT frame.
         """
         windowmode = self.param_dict["windowmode"]
         if windowmode != "single":
@@ -122,7 +61,7 @@ class TFTransformer(object):
             # then add boundary STFT frames to the STFT
             frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
-                reflect_block = pad_boundary_rows(initial_block[frame0:], windowsize, 'left')
+                reflect_block = self._pad_boundary_rows(initial_block[frame0:], windowsize, 'left')
                 yield self.wft(reflect_block, window, fftsize)
                 frame0 += hopsize
         elif buffermode == "reconstruction":
@@ -166,7 +105,7 @@ class TFTransformer(object):
             frame1 = 0
             halfwindowsize = (windowsize // 2)  # Floored if odd
             while final_frames - frame1 >= halfwindowsize:
-                reflect_block = pad_boundary_rows(final_block[frame1:], windowsize, 'right')
+                reflect_block = self._pad_boundary_rows(final_block[frame1:], windowsize, 'right')
                 yield self.wft(reflect_block, window, fftsize)
                 frame1 += hopsize
         elif buffermode == "reconstruction":
@@ -190,6 +129,68 @@ class TFTransformer(object):
 
     def wft(self, block: np.ndarray, window: np.ndarray, fftsize: int) -> np.ndarray:
         if self.param_dict["realfft"]:
-            return np.fft.rfft(zeropad_rows(window * block, fftsize))
+            return np.fft.rfft(self._zeropad_rows(window * block, fftsize))
         else:
-            return np.fft.fft(zeropad_rows(window * block, fftsize))
+            return np.fft.fft(self._zeropad_rows(window * block, fftsize))
+
+    @staticmethod
+    def _pad_boundary_rows(input_array: np.ndarray, finalsize: int, side: str) -> np.ndarray:
+        """
+        Pad each channel of a buffer, where channels are assumed to be in rows.
+        Padding happens at the boundary, by even reflection.
+
+        :param input_array: array to be padded by reflection
+        :param finalsize: finalsize: final size of the array (example: window size)
+        :param side: "left" or "right" to do the padding.
+                     i.e., if "left", then padding is done to the left of the input array.
+        :return: output_array: reflection-padded array
+        """
+        inputsize = input_array.shape[0]
+        padsize = finalsize - inputsize
+        if side == "left":
+            padsize_left = padsize
+            padsize_right = 0
+        elif side == "right":
+            padsize_left = 0
+            padsize_right = padsize
+        else:
+            raise ValueError("Pad side {} to pad_boundary_rows is invalid, "
+                             "must be 'left' or 'right'".format(side))
+
+        if len(input_array.shape) == 2:
+            output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='reflect')
+        elif len(input_array.shape) == 1:
+            output_array = np.pad(input_array, (padsize_left, padsize_right), mode='reflect')
+        else:
+            raise ValueError("input array to pad_boundary_rows has dimensions {}, "
+                             "which is not supported".format(input_array.shape))
+
+        return output_array
+
+    @staticmethod
+    def _zeropad_rows(input_array: np.ndarray, finalsize: int) -> np.ndarray:
+        """
+        Zeropad each channel of a buffer, where channels are assumed to be in rows.
+        Padding happens with the input array centered, and zeros padded equally on left and right,
+        unless finalsize minus inputsize is odd.
+        This is used for preparing a windowed array to be sent to an FFT.
+
+        :param input_array: array to be padded with zeros
+        :param finalsize: final size of the array (example: FFT size)
+        :return: output_array: zero-padded array
+        """
+        inputsize = input_array.shape[0]
+
+        padsize = finalsize - inputsize
+        padsize_left = padsize // 2
+        padsize_right = padsize - padsize_left
+
+        if len(input_array.shape) == 2:
+            output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='constant')
+        elif len(input_array.shape) == 1:
+            output_array = np.pad(input_array, (padsize_left, padsize_right), mode='constant')
+        else:
+            raise ValueError("input array to zeropad_rows has dimensions {}, "
+                             "which is not supported".format(input_array.shape))
+
+        return output_array
