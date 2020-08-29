@@ -12,18 +12,20 @@ class TFTransformer(object):
         self.initialize_default_params()
 
     def initialize_default_params(self):
-        self.param_dict = {"hopsize":                    256,  # Test with 215
-                           "windowfunc":          np.hanning,
-                           "windowmode":            "single",
-                           "windowsize":                4096,  # Test with 4095
-                           "fftsize":                   4096,
-                           "buffermode": "centered_analysis",
-                           "sstsize":                   6000,  # Test with 6007
-                           "realfft":                   True,
-                           "compute_stft":              True,
-                           "compute_sst":              False,
-                           "compute_jtfrm":            False,
-                           "compute_qstft":            False,
+        self.param_dict = {"hopsize":                       256,  # Test with 215
+                           "windowfunc":             np.hanning,
+                           "windowmode":               "single",
+                           "windowsize":                   4096,  # Test with 4095
+                           "fftsize":                      4096,
+                           "buffermode":    "centered_analysis",
+                           "sstsize":                      6000,  # Test with 6007
+                           "realfft":                      True,
+                           "compute_stft":                 True,
+                           "compute_sst":                 False,
+                           "compute_jtfrm":               False,
+                           "compute_qstft":               False,
+                           "eps_division":              1.0e-16,
+                           "reassignment_mode":         "magsq",  # "magsq" or "complex"
                           }
 
     def compute_stft(self):
@@ -52,13 +54,12 @@ class TFTransformer(object):
         overlap = windowsize - hopsize
         window = windowfunc(windowsize)
 
-        # Initialize the stft
-        # This should be a separate function
+        # Compute the left boundary STFT frames
+        # Will refactor later when I put in the "reconstruction" buffering mode.
         if buffermode == "centered_analysis":
             initial_block = self.AudioSignal.read(frames=windowsize)
             initial_block = initial_block.T
-            # Pad the boundary with reflected audio frames,
-            # then add boundary STFT frames to the STFT
+            # Pad the boundary with reflected audio frames, then yield the boundary STFT frame
             frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
                 reflect_block = self._pad_boundary_rows(initial_block[frame0:], windowsize, 'left')
@@ -90,7 +91,7 @@ class TFTransformer(object):
             yield self.wft(block, window, fftsize)
             frame0 += hopsize
 
-        # Now treat the right boundary
+        # Compute the right boundary STFT frames
         if buffermode == "centered_analysis":
             # Need to read from frame0
             self.AudioSignal.seek(frames=frame0)
@@ -125,7 +126,53 @@ class TFTransformer(object):
         hopsize = self.param_dict["hopsize"]
         windowsize = self.param_dict["windowsize"]
         fftsize = self.param_dict["fftsize"]
+        if windowsize > fftsize:
+            raise ValueError("window size {} is larger than FFT size {}!".format(windowsize, fftsize))
+        sstsize = self.param_dict["sstsize"]
         windowfunc = self.param_dict["windowfunc"]
+        buffermode = self.param_dict["buffermode"]
+        overlap = windowsize - hopsize
+        window = windowfunc(windowsize)
+        eps_division = self.param_dict["eps_division"]
+        reassignment_mode = self.param_dict["reassignment_mode"]
+
+        twopi = np.pi * 2
+        channels = self.AudioSignal.channels
+        if channels > 1:
+            sstshape = (sstsize, channels)
+        else:
+            sstshape = (sstsize, )
+        if reassignment_mode == "magsq":
+            rmvaluemap = lambda x: np.abs(x) ** 2.0
+        elif reassignment_mode == "complex":
+            rmvaluemap = lambda x: x
+        else:
+            raise ValueError("Invalid reassignment_mode {}".format(reassignment_mode))
+
+        # Compute the left boundary SST frames
+        # Will refactor later when I put in the "reconstruction" buffering mode.
+        if buffermode == "centered_analysis":
+            initial_block = self.AudioSignal.read(frames=windowsize + 1)
+            initial_block = initial_block.T
+            # Pad the boundary with reflected audio frames, then yield the boundary STFT frames necessary
+            frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
+            while frame0 < 0:
+                reflect_block = self._pad_boundary_rows(initial_block[frame0:(frame0 + windowsize)],
+                                                        windowsize, 'left')
+                wft = self.wft(reflect_block, window, fftsize)
+                reflect_block = self._pad_boundary_rows(initial_block[(frame0 + 1):(frame0 + 1 + windowsize)],
+                                                        windowsize, 'left')
+                wft_plus = self.wft(reflect_block, window, fftsize)
+                rf = np.angle(wft_plus / (wft + eps_division)) / twopi   # Unit: Normalized frequency
+                yield np.add.at(np.zeros(sstshape), (rf * sstsize).astype(int), rmvaluemap(wft))
+                frame0 += hopsize
+        elif buffermode == "reconstruction":
+            pass  # FILL THIS IN
+            frame0 = 0
+        elif buffermode == "valid_analysis":
+            frame0 = 0
+        else:
+            raise ValueError("Invalid buffermode {}".format(buffermode))
 
     def wft(self, block: np.ndarray, window: np.ndarray, fftsize: int) -> np.ndarray:
         if self.param_dict["realfft"]:
