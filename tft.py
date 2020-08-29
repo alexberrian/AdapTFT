@@ -64,7 +64,7 @@ class TFTransformer(object):
             # Pad the boundary with reflected audio frames, then yield the boundary STFT frame
             frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
-                reflect_block = self._pad_boundary_rows(initial_block[frame0:], windowsize, 'left')
+                reflect_block = self._pad_boundary_rows(initial_block[:frame0], windowsize, 'left')
                 yield self.wft(reflect_block, window, fftsize)
                 frame0 += hopsize
         elif buffermode == "reconstruction":
@@ -113,13 +113,21 @@ class TFTransformer(object):
                 frame1 += hopsize
         elif buffermode == "reconstruction":
             pass  # FILL THIS IN
-            frame1 = 0
         elif buffermode == "valid_analysis":  # Do nothing at this point
             pass
         else:
             raise ValueError("Invalid buffermode {}".format(buffermode))
 
     def compute_sst(self):
+        """
+        TO DO:
+        - Investigate the non-realfft case
+        - Deal with mono vs. stereo etc.
+        - Obviously condense repeated code into a generic reassignment modules
+        :yield: synchrosqueezing transform of the given STFT frame
+        """
+        if not self.param_dict["realfft"]:
+            raise ValueError("Must have realfft to compute SST, untested otherwise!")
         windowmode = self.param_dict["windowmode"]
         if windowmode != "single":
             raise ValueError("windowmode (currently) must be 'single' for SST, "
@@ -143,10 +151,11 @@ class TFTransformer(object):
 
         twopi = np.pi * 2
         channels = self.AudioSignal.channels
+        num_bins_up_to_nyquist = (sstsize // 2) + 1
         if channels > 1:
-            sstshape = (sstsize, channels)
+            sstshape = (num_bins_up_to_nyquist, channels)  # Change for non-real FFT
         else:
-            sstshape = (sstsize, )
+            sstshape = (num_bins_up_to_nyquist, )  # Change for non-real FFT
         if reassignment_mode == "magsq":
             rmvaluemap = lambda x: np.abs(x) ** 2.0
         elif reassignment_mode == "complex":
@@ -162,14 +171,22 @@ class TFTransformer(object):
             # Pad the boundary with reflected audio frames, then yield the boundary STFT frames necessary
             frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
-                reflect_block = self._pad_boundary_rows(initial_block[frame0:(frame0 + windowsize)],
+                reflect_block = self._pad_boundary_rows(initial_block[:(frame0 + windowsize)],
                                                         windowsize, 'left')
                 wft = self.wft(reflect_block, window, fftsize)
-                reflect_block = self._pad_boundary_rows(initial_block[(frame0 + 1):(frame0 + windowsize_p1)],
+                # Note that for the below, we go to (frame0 + windowsize_p1) because the important thing
+                # is that the reflection of the function about time 0 must be the same so that you are
+                # analyzing the same function.
+                reflect_block = self._pad_boundary_rows(initial_block[:(frame0 + windowsize_p1)],
                                                         windowsize, 'left')
                 wft_plus = self.wft(reflect_block, window, fftsize)
                 rf = np.angle(wft_plus / (wft + eps_division)) / twopi   # Unit: Normalized frequency
-                yield np.add.at(np.zeros(sstshape), (rf * sstsize).astype(int), rmvaluemap(wft))
+                out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
+                wft[out_of_bounds] = 0
+                rf[out_of_bounds] = 0
+                sst_out = np.zeros(sstshape, dtype=(complex if reassignment_mode == "complex" else float))
+                np.add.at(sst_out, (rf * sstsize).astype(int), rmvaluemap(wft))  # Change for non-real FFT
+                yield sst_out
                 frame0 += hopsize
         elif buffermode == "reconstruction":
             pass  # FILL THIS IN
@@ -198,7 +215,12 @@ class TFTransformer(object):
             wft = self.wft(block[:windowsize], window, fftsize)
             wft_plus = self.wft(block[1:], window, fftsize)
             rf = np.angle(wft_plus / (wft + eps_division)) / twopi  # Unit: Normalized frequency
-            yield np.add.at(np.zeros(sstshape), (rf * sstsize).astype(int), rmvaluemap(wft))
+            out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
+            wft[out_of_bounds] = 0
+            rf[out_of_bounds] = 0
+            sst_out = np.zeros(sstshape, dtype=(complex if reassignment_mode == "complex" else float))
+            np.add.at(sst_out, (rf * sstsize).astype(int), rmvaluemap(wft))  # Change for non-real FFT
+            yield sst_out
             frame0 += hopsize
 
         # Compute the right boundary SST frames
@@ -224,11 +246,15 @@ class TFTransformer(object):
                                                         windowsize, 'right')
                 wft_plus = self.wft(reflect_block, window, fftsize)
                 rf = np.angle(wft_plus / (wft + eps_division)) / twopi  # Unit: Normalized frequency
-                yield np.add.at(np.zeros(sstshape), (rf * sstsize).astype(int), rmvaluemap(wft))
+                out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
+                wft[out_of_bounds] = 0
+                rf[out_of_bounds] = 0
+                sst_out = np.zeros(sstshape, dtype=(complex if reassignment_mode == "complex" else float))
+                np.add.at(sst_out, (rf * sstsize).astype(int), rmvaluemap(wft))  # Change for non-real FFT
+                yield sst_out
                 frame1 += hopsize
         elif buffermode == "reconstruction":
             pass  # FILL THIS IN
-            frame1 = 0
         elif buffermode == "valid_analysis":  # Do nothing at this point
             pass
         else:
