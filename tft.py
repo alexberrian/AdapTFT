@@ -46,6 +46,8 @@ class TFTransformer(object):
                              "instead it is {}".format(windowmode))
         hopsize = self.param_dict["hopsize"]
         windowsize = self.param_dict["windowsize"]
+        if windowsize < 2:
+            raise ValueError("windowsize {} must be at least 2".format(windowsize))
         fftsize = self.param_dict["fftsize"]
         if windowsize > fftsize:
             raise ValueError("window size {} is larger than FFT size {}!".format(windowsize, fftsize))
@@ -97,15 +99,15 @@ class TFTransformer(object):
             self.AudioSignal.seek(frames=frame0)
             final_block = self.AudioSignal.read()  # Read the rest of the file from there
             final_block = final_block.T
-            final_frames = final_block.shape[0]
-            if final_frames >= windowsize:
-                raise ValueError("You shouldn't have final_frames {} "
-                                 "greater than windowsize {}".format(final_frames, windowsize))
+            final_block_num_frames = final_block.shape[0]
+            if final_block_num_frames >= windowsize:
+                raise ValueError("You shouldn't have final_block_num_frames {} "
+                                 "greater than windowsize {}".format(final_block_num_frames, windowsize))
             # Pad the boundary with reflected audio frames,
             # then add boundary STFT frames to the STFT
             frame1 = 0
-            halfwindowsize = (windowsize // 2)  # Floored if odd
-            while final_frames - frame1 >= halfwindowsize:
+            halfwindowsize = (windowsize + 1) // 2   # Edge case: odd windows, want final valid sample to be in middle
+            while final_block_num_frames - frame1 >= halfwindowsize:
                 reflect_block = self._pad_boundary_rows(final_block[frame1:], windowsize, 'right')
                 yield self.wft(reflect_block, window, fftsize)
                 frame1 += hopsize
@@ -125,13 +127,16 @@ class TFTransformer(object):
                              "Will support SST based on QSTFT later.".format(windowmode))
         hopsize = self.param_dict["hopsize"]
         windowsize = self.param_dict["windowsize"]
+        if windowsize < 4:
+            raise ValueError("windowsize {} must be at least 4 to deal with edge cases for SST".format(windowsize))
+        windowsize_p1 = windowsize + 1
         fftsize = self.param_dict["fftsize"]
         if windowsize > fftsize:
             raise ValueError("window size {} is larger than FFT size {}!".format(windowsize, fftsize))
         sstsize = self.param_dict["sstsize"]
         windowfunc = self.param_dict["windowfunc"]
         buffermode = self.param_dict["buffermode"]
-        overlap = windowsize - hopsize
+        overlap = (windowsize + 1) - hopsize  # For SST block procedure
         window = windowfunc(windowsize)
         eps_division = self.param_dict["eps_division"]
         reassignment_mode = self.param_dict["reassignment_mode"]
@@ -160,7 +165,7 @@ class TFTransformer(object):
                 reflect_block = self._pad_boundary_rows(initial_block[frame0:(frame0 + windowsize)],
                                                         windowsize, 'left')
                 wft = self.wft(reflect_block, window, fftsize)
-                reflect_block = self._pad_boundary_rows(initial_block[(frame0 + 1):(frame0 + 1 + windowsize)],
+                reflect_block = self._pad_boundary_rows(initial_block[(frame0 + 1):(frame0 + windowsize_p1)],
                                                         windowsize, 'left')
                 wft_plus = self.wft(reflect_block, window, fftsize)
                 rf = np.angle(wft_plus / (wft + eps_division)) / twopi   # Unit: Normalized frequency
@@ -171,6 +176,61 @@ class TFTransformer(object):
             frame0 = 0
         elif buffermode == "valid_analysis":
             frame0 = 0
+        else:
+            raise ValueError("Invalid buffermode {}".format(buffermode))
+
+        # May refactor the following four non-comment code lines for full generality
+        # Get the number of audio frames, and seek to the audio frame given by frame0
+        num_audio_frames = self.AudioSignal.get_num_frames_from_and_seek_start(start_frame=frame0)
+
+        # Now calculate the max number of FULL non-boundary SST frames,
+        # considering hop size and window size.  Have to modify because taking more frames than usual.
+        num_full_sst_frames = 1 + ((num_audio_frames - windowsize_p1) // hopsize)
+
+        # Convert that to the number of audio frames that you'll analyze for non-boundary SST.
+        num_audio_frames_full_sst = (num_full_sst_frames - 1) * hopsize + windowsize_p1
+
+        # Feed blocks to create the non-boundary SST frames, with
+        blockreader = self.AudioSignal.blocks(blocksize=windowsize_p1, overlap=overlap,
+                                              frames=num_audio_frames_full_sst)
+        for block in blockreader:
+            block = block.T  # First transpose to get each channel as a row
+            wft = self.wft(block[:windowsize], window, fftsize)
+            wft_plus = self.wft(block[1:], window, fftsize)
+            rf = np.angle(wft_plus / (wft + eps_division)) / twopi  # Unit: Normalized frequency
+            yield np.add.at(np.zeros(sstshape), (rf * sstsize).astype(int), rmvaluemap(wft))
+            frame0 += hopsize
+
+        # Compute the right boundary SST frames
+        if buffermode == "centered_analysis":
+            # Need to read from frame0
+            self.AudioSignal.seek(frames=frame0)
+            final_block = self.AudioSignal.read()  # Read the rest of the file (length less than windowsize+1)
+            final_block = final_block.T
+            final_block_num_frames = final_block.shape[0]
+            if final_block_num_frames >= windowsize_p1:
+                raise ValueError("You shouldn't have final_block_num_frames {} "
+                                 "greater than windowsize + 1 == {}".format(final_block_num_frames, windowsize_p1))
+            # Pad the boundary with reflected audio frames,
+            # then add boundary STFT frames to the STFT
+            frame1 = 0
+            halfwindowsize = (windowsize + 1) // 2   # Edge case: odd windows, want final valid sample to be in middle
+            while final_block_num_frames - frame1 >= halfwindowsize:
+                reflect_block = self._pad_boundary_rows(final_block[frame1:], windowsize, 'right')
+                wft = self.wft(reflect_block, window, fftsize)
+                # EDGE CASE: frame1 + 1 may not be valid index of final_block if halfwindowsize == 1,
+                # i.e. if windowsize < 4.  That is why we require windowsize >= 4.
+                reflect_block = self._pad_boundary_rows(final_block[frame1 + 1:(frame1 + windowsize_p1)],
+                                                        windowsize, 'right')
+                wft_plus = self.wft(reflect_block, window, fftsize)
+                rf = np.angle(wft_plus / (wft + eps_division)) / twopi  # Unit: Normalized frequency
+                yield np.add.at(np.zeros(sstshape), (rf * sstsize).astype(int), rmvaluemap(wft))
+                frame1 += hopsize
+        elif buffermode == "reconstruction":
+            pass  # FILL THIS IN
+            frame1 = 0
+        elif buffermode == "valid_analysis":  # Do nothing at this point
+            pass
         else:
             raise ValueError("Invalid buffermode {}".format(buffermode))
 
@@ -193,26 +253,29 @@ class TFTransformer(object):
         :return: output_array: reflection-padded array
         """
         inputsize = input_array.shape[0]
-        padsize = finalsize - inputsize
-        if side == "left":
-            padsize_left = padsize
-            padsize_right = 0
-        elif side == "right":
-            padsize_left = 0
-            padsize_right = padsize
+        if finalsize == inputsize:
+            return input_array
         else:
-            raise ValueError("Pad side {} to pad_boundary_rows is invalid, "
-                             "must be 'left' or 'right'".format(side))
+            padsize = finalsize - inputsize
+            if side == "left":
+                padsize_left = padsize
+                padsize_right = 0
+            elif side == "right":
+                padsize_left = 0
+                padsize_right = padsize
+            else:
+                raise ValueError("Pad side {} to pad_boundary_rows is invalid, "
+                                 "must be 'left' or 'right'".format(side))
 
-        if len(input_array.shape) == 2:
-            output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='reflect')
-        elif len(input_array.shape) == 1:
-            output_array = np.pad(input_array, (padsize_left, padsize_right), mode='reflect')
-        else:
-            raise ValueError("input array to pad_boundary_rows has dimensions {}, "
-                             "which is not supported".format(input_array.shape))
+            if len(input_array.shape) == 2:
+                output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='reflect')
+            elif len(input_array.shape) == 1:
+                output_array = np.pad(input_array, (padsize_left, padsize_right), mode='reflect')
+            else:
+                raise ValueError("input array to pad_boundary_rows has dimensions {}, "
+                                 "which is not supported".format(input_array.shape))
 
-        return output_array
+            return output_array
 
     @staticmethod
     def _zeropad_rows(input_array: np.ndarray, finalsize: int) -> np.ndarray:
@@ -227,17 +290,19 @@ class TFTransformer(object):
         :return: output_array: zero-padded array
         """
         inputsize = input_array.shape[0]
-
-        padsize = finalsize - inputsize
-        padsize_left = padsize // 2
-        padsize_right = padsize - padsize_left
-
-        if len(input_array.shape) == 2:
-            output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='constant')
-        elif len(input_array.shape) == 1:
-            output_array = np.pad(input_array, (padsize_left, padsize_right), mode='constant')
+        if inputsize == finalsize:
+            return input_array
         else:
-            raise ValueError("input array to zeropad_rows has dimensions {}, "
-                             "which is not supported".format(input_array.shape))
+            padsize = finalsize - inputsize
+            padsize_left = padsize // 2
+            padsize_right = padsize - padsize_left
 
-        return output_array
+            if len(input_array.shape) == 2:
+                output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='constant')
+            elif len(input_array.shape) == 1:
+                output_array = np.pad(input_array, (padsize_left, padsize_right), mode='constant')
+            else:
+                raise ValueError("input array to zeropad_rows has dimensions {}, "
+                                 "which is not supported".format(input_array.shape))
+
+            return output_array
