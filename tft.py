@@ -1,10 +1,13 @@
 import numpy as np
 from audio_io import AudioSignal
-#from typing import Callable
-#from typing import Generator
+# from typing import Callable
+# from typing import Generator
+
+TWOPI = np.pi * 2
 
 
 class TFTransformer(object):
+
     def __init__(self, filename):
         self.AudioSignal = AudioSignal(filename)
         self.param_dict = {}
@@ -123,7 +126,6 @@ class TFTransformer(object):
         TO DO:
         - Investigate the non-realfft case
         - Deal with mono vs. stereo etc.
-        - Obviously condense repeated code into a generic reassignment modules
         :yield: synchrosqueezing transform of the given STFT frame
         """
         if not self.param_dict["realfft"]:
@@ -146,22 +148,7 @@ class TFTransformer(object):
         buffermode = self.param_dict["buffermode"]
         overlap = (windowsize + 1) - hopsize  # For SST block procedure
         window = windowfunc(windowsize)
-        eps_division = self.param_dict["eps_division"]
         reassignment_mode = self.param_dict["reassignment_mode"]
-
-        twopi = np.pi * 2
-        channels = self.AudioSignal.channels
-        num_bins_up_to_nyquist = (sstsize // 2) + 1
-        if channels > 1:
-            sstshape = (num_bins_up_to_nyquist, channels)  # Change for non-real FFT
-        else:
-            sstshape = (num_bins_up_to_nyquist, )  # Change for non-real FFT
-        if reassignment_mode == "magsq":
-            rmvaluemap = lambda x: np.abs(x) ** 2.0
-        elif reassignment_mode == "complex":
-            rmvaluemap = lambda x: x
-        else:
-            raise ValueError("Invalid reassignment_mode {}".format(reassignment_mode))
 
         # Compute the left boundary SST frames
         # Will refactor later when I put in the "reconstruction" buffering mode.
@@ -171,22 +158,11 @@ class TFTransformer(object):
             # Pad the boundary with reflected audio frames, then yield the boundary STFT frames necessary
             frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
-                reflect_block = self._pad_boundary_rows(initial_block[:(frame0 + windowsize)],
-                                                        windowsize, 'left')
-                wft = self.wft(reflect_block, window, fftsize)
-                # Note that for the below, we go to (frame0 + windowsize_p1) because the important thing
-                # is that the reflection of the function about time 0 must be the same so that you are
-                # analyzing the same function.
-                reflect_block = self._pad_boundary_rows(initial_block[:(frame0 + windowsize_p1)],
-                                                        windowsize, 'left')
-                wft_plus = self.wft(reflect_block, window, fftsize)
-                rf = np.angle(wft_plus / (wft + eps_division)) / twopi   # Unit: Normalized frequency
-                out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
-                wft[out_of_bounds] = 0
-                rf[out_of_bounds] = 0
-                sst_out = np.zeros(sstshape, dtype=(complex if reassignment_mode == "complex" else float))
-                np.add.at(sst_out, (rf * sstsize).astype(int), rmvaluemap(wft))  # Change for non-real FFT
-                yield sst_out
+                reflect_block = self._pad_boundary_rows(initial_block[:(frame0 + windowsize)], windowsize, 'left')
+                reflect_block_plus = self._pad_boundary_rows(initial_block[:(frame0 + windowsize_p1)],
+                                                             windowsize, 'left')
+                yield self._reassign_sst(reflect_block, reflect_block_plus, window, fftsize, sstsize,
+                                         reassignment_mode)
                 frame0 += hopsize
         elif buffermode == "reconstruction":
             pass  # FILL THIS IN
@@ -212,15 +188,7 @@ class TFTransformer(object):
                                               frames=num_audio_frames_full_sst)
         for block in blockreader:
             block = block.T  # First transpose to get each channel as a row
-            wft = self.wft(block[:windowsize], window, fftsize)
-            wft_plus = self.wft(block[1:], window, fftsize)
-            rf = np.angle(wft_plus / (wft + eps_division)) / twopi  # Unit: Normalized frequency
-            out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
-            wft[out_of_bounds] = 0
-            rf[out_of_bounds] = 0
-            sst_out = np.zeros(sstshape, dtype=(complex if reassignment_mode == "complex" else float))
-            np.add.at(sst_out, (rf * sstsize).astype(int), rmvaluemap(wft))  # Change for non-real FFT
-            yield sst_out
+            yield self._reassign_sst(block[:windowsize], block[1:], window, fftsize, sstsize, reassignment_mode)
             frame0 += hopsize
 
         # Compute the right boundary SST frames
@@ -239,19 +207,10 @@ class TFTransformer(object):
             halfwindowsize = (windowsize + 1) // 2   # Edge case: odd windows, want final valid sample to be in middle
             while final_block_num_frames - frame1 >= halfwindowsize:
                 reflect_block = self._pad_boundary_rows(final_block[frame1:], windowsize, 'right')
-                wft = self.wft(reflect_block, window, fftsize)
-                # EDGE CASE: frame1 + 1 may not be valid index of final_block if halfwindowsize == 1,
-                # i.e. if windowsize < 4.  That is why we require windowsize >= 4.
-                reflect_block = self._pad_boundary_rows(final_block[frame1 + 1:(frame1 + windowsize_p1)],
-                                                        windowsize, 'right')
-                wft_plus = self.wft(reflect_block, window, fftsize)
-                rf = np.angle(wft_plus / (wft + eps_division)) / twopi  # Unit: Normalized frequency
-                out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
-                wft[out_of_bounds] = 0
-                rf[out_of_bounds] = 0
-                sst_out = np.zeros(sstshape, dtype=(complex if reassignment_mode == "complex" else float))
-                np.add.at(sst_out, (rf * sstsize).astype(int), rmvaluemap(wft))  # Change for non-real FFT
-                yield sst_out
+                reflect_block_plus = self._pad_boundary_rows(final_block[frame1 + 1:(frame1 + windowsize_p1)],
+                                                             windowsize, 'right')
+                yield self._reassign_sst(reflect_block, reflect_block_plus, window, fftsize, sstsize,
+                                         reassignment_mode)
                 frame1 += hopsize
         elif buffermode == "reconstruction":
             pass  # FILL THIS IN
@@ -265,6 +224,35 @@ class TFTransformer(object):
             return np.fft.rfft(self._zeropad_rows(window * block, fftsize))
         else:
             return np.fft.fft(self._zeropad_rows(window * block, fftsize))
+
+    @staticmethod
+    def _reassignment_value_map(x: np.ndarray, reassignment_mode):
+        if reassignment_mode == "magsq":
+            return np.abs(x) ** 2.0
+        elif reassignment_mode == "complex":
+            return x
+        else:
+            raise ValueError("Invalid reassignment_mode {}".format(reassignment_mode))
+
+    def _reassign_sst(self, f, f_plus, window, fftsize, sstsize, reassignment_mode):
+        eps_division = self.param_dict["eps_division"]
+        channels = self.AudioSignal.channels
+        num_bins_up_to_nyquist = (sstsize // 2) + 1
+        if channels > 1:
+            sstshape = (num_bins_up_to_nyquist, channels)  # Change for non-real FFT
+        else:
+            sstshape = (num_bins_up_to_nyquist,)  # Change for non-real FFT
+
+        wft = self.wft(f, window, fftsize)
+        wft_plus = self.wft(f_plus, window, fftsize)
+        rf = np.angle(wft_plus / (wft + eps_division)) / TWOPI  # Unit: Normalized frequency
+        out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
+        wft[out_of_bounds] = 0
+        rf[out_of_bounds] = 0
+        sst_out = np.zeros(sstshape, dtype=(complex if reassignment_mode == "complex" else float))
+        # May need to change the line below for non-real FFT for reconstruction???  I don't remember
+        np.add.at(sst_out, (rf * sstsize).astype(int), self._reassignment_value_map(wft, reassignment_mode))
+        return sst_out
 
     @staticmethod
     def _pad_boundary_rows(input_array: np.ndarray, finalsize: int, side: str) -> np.ndarray:
