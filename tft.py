@@ -62,12 +62,12 @@ class TFTransformer(object):
         # Compute the left boundary STFT frames
         # Will refactor later when I put in the "reconstruction" buffering mode.
         if buffermode == "centered_analysis":
-            initial_block = self.AudioSignal.read(frames=windowsize)
+            initial_block = self.AudioSignal.read(frames=windowsize, always_2d=True)
             initial_block = initial_block.T
             # Pad the boundary with reflected audio frames, then yield the boundary STFT frame
             frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
-                reflect_block = self._pad_boundary_rows(initial_block[:frame0], windowsize, 'left')
+                reflect_block = self._pad_boundary_rows(initial_block[:, :frame0], windowsize, 'left')
                 yield self.wft(reflect_block, window, fftsize)
                 frame0 += hopsize
         elif buffermode == "reconstruction":
@@ -90,7 +90,7 @@ class TFTransformer(object):
 
         # Feed blocks to create the non-boundary STFT frames
         blockreader = self.AudioSignal.blocks(blocksize=windowsize, overlap=overlap,
-                                              frames=num_audio_frames_full_stft)
+                                              frames=num_audio_frames_full_stft, always_2d=True)
         for block in blockreader:
             block = block.T  # First transpose to get each channel as a row
             yield self.wft(block, window, fftsize)
@@ -100,9 +100,9 @@ class TFTransformer(object):
         if buffermode == "centered_analysis":
             # Need to read from frame0
             self.AudioSignal.seek(frames=frame0)
-            final_block = self.AudioSignal.read()  # Read the rest of the file from there
+            final_block = self.AudioSignal.read(always_2d=True)  # Read the rest of the file from there
             final_block = final_block.T
-            final_block_num_frames = final_block.shape[0]
+            final_block_num_frames = final_block.shape[1]
             if final_block_num_frames >= windowsize:
                 raise ValueError("You shouldn't have final_block_num_frames {} "
                                  "greater than windowsize {}".format(final_block_num_frames, windowsize))
@@ -111,7 +111,7 @@ class TFTransformer(object):
             frame1 = 0
             halfwindowsize = (windowsize + 1) // 2   # Edge case: odd windows, want final valid sample to be in middle
             while final_block_num_frames - frame1 >= halfwindowsize:
-                reflect_block = self._pad_boundary_rows(final_block[frame1:], windowsize, 'right')
+                reflect_block = self._pad_boundary_rows(final_block[:, frame1:], windowsize, 'right')
                 yield self.wft(reflect_block, window, fftsize)
                 frame1 += hopsize
         elif buffermode == "reconstruction":
@@ -153,13 +153,13 @@ class TFTransformer(object):
         # Compute the left boundary SST frames
         # Will refactor later when I put in the "reconstruction" buffering mode.
         if buffermode == "centered_analysis":
-            initial_block = self.AudioSignal.read(frames=windowsize + 1)
+            initial_block = self.AudioSignal.read(frames=windowsize + 1, always_2d=True)
             initial_block = initial_block.T
             # Pad the boundary with reflected audio frames, then yield the boundary STFT frames necessary
             frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
-                reflect_block = self._pad_boundary_rows(initial_block[:(frame0 + windowsize)], windowsize, 'left')
-                reflect_block_plus = self._pad_boundary_rows(initial_block[:(frame0 + windowsize_p1)],
+                reflect_block = self._pad_boundary_rows(initial_block[:, :(frame0 + windowsize)], windowsize, 'left')
+                reflect_block_plus = self._pad_boundary_rows(initial_block[:, :(frame0 + windowsize_p1)],
                                                              windowsize, 'left')
                 yield self._reassign_sst(reflect_block, reflect_block_plus, window, fftsize, sstsize,
                                          reassignment_mode)
@@ -185,19 +185,20 @@ class TFTransformer(object):
 
         # Feed blocks to create the non-boundary SST frames, with
         blockreader = self.AudioSignal.blocks(blocksize=windowsize_p1, overlap=overlap,
-                                              frames=num_audio_frames_full_sst)
+                                              frames=num_audio_frames_full_sst, always_2d=True)
         for block in blockreader:
             block = block.T  # First transpose to get each channel as a row
-            yield self._reassign_sst(block[:windowsize], block[1:], window, fftsize, sstsize, reassignment_mode)
+            yield self._reassign_sst(block[:, :windowsize], block[:, 1:], window, fftsize, sstsize, reassignment_mode)
             frame0 += hopsize
 
         # Compute the right boundary SST frames
         if buffermode == "centered_analysis":
             # Need to read from frame0
             self.AudioSignal.seek(frames=frame0)
-            final_block = self.AudioSignal.read()  # Read the rest of the file (length less than windowsize+1)
+            # Read the rest of the file (length less than windowsize+1)
+            final_block = self.AudioSignal.read(always_2d=True)
             final_block = final_block.T
-            final_block_num_frames = final_block.shape[0]
+            final_block_num_frames = final_block.shape[1]
             if final_block_num_frames >= windowsize_p1:
                 raise ValueError("You shouldn't have final_block_num_frames {} "
                                  "greater than windowsize + 1 == {}".format(final_block_num_frames, windowsize_p1))
@@ -206,8 +207,8 @@ class TFTransformer(object):
             frame1 = 0
             halfwindowsize = (windowsize + 1) // 2   # Edge case: odd windows, want final valid sample to be in middle
             while final_block_num_frames - frame1 >= halfwindowsize:
-                reflect_block = self._pad_boundary_rows(final_block[frame1:], windowsize, 'right')
-                reflect_block_plus = self._pad_boundary_rows(final_block[frame1 + 1:(frame1 + windowsize_p1)],
+                reflect_block = self._pad_boundary_rows(final_block[:, frame1:], windowsize, 'right')
+                reflect_block_plus = self._pad_boundary_rows(final_block[:, frame1 + 1:(frame1 + windowsize_p1)],
                                                              windowsize, 'right')
                 yield self._reassign_sst(reflect_block, reflect_block_plus, window, fftsize, sstsize,
                                          reassignment_mode)
@@ -219,14 +220,19 @@ class TFTransformer(object):
         else:
             raise ValueError("Invalid buffermode {}".format(buffermode))
 
-    def wft(self, block: np.ndarray, window: np.ndarray, fftsize: int) -> np.ndarray:
-        if self.param_dict["realfft"]:
+    def wft(self, block: np.ndarray, window: np.ndarray, fftsize: int, fft_type="real") -> np.ndarray:
+        if fft_type == "real":
             return np.fft.rfft(self._zeropad_rows(window * block, fftsize))
-        else:
+        elif fft_type == "complex_short":
+            return np.fft.fft(self._zeropad_rows(window * block, fftsize))[:, :(1 + (fftsize // 2))]
+        elif fft_type == "complex_full":  # For reconstruction
             return np.fft.fft(self._zeropad_rows(window * block, fftsize))
+        else:
+            raise ValueError("Invalid fft_type {}, must use 'real', 'complex_short', "
+                             "or 'complex_full'".format(fft_type))
 
     @staticmethod
-    def _reassignment_value_map(x: np.ndarray, reassignment_mode):
+    def _reassignment_value_map(x: np.ndarray, reassignment_mode: str):
         if reassignment_mode == "magsq":
             return np.abs(x) ** 2.0
         elif reassignment_mode == "complex":
@@ -234,14 +240,12 @@ class TFTransformer(object):
         else:
             raise ValueError("Invalid reassignment_mode {}".format(reassignment_mode))
 
-    def _reassign_sst(self, f, f_plus, window, fftsize, sstsize, reassignment_mode):
+    def _reassign_sst(self, f: np.ndarray, f_plus: np.ndarray, window: np.ndarray,
+                      fftsize: int, sstsize: int, reassignment_mode: str):
         eps_division = self.param_dict["eps_division"]
         channels = self.AudioSignal.channels
         num_bins_up_to_nyquist = (sstsize // 2) + 1
-        if channels > 1:
-            sstshape = (num_bins_up_to_nyquist, channels)  # Change for non-real FFT
-        else:
-            sstshape = (num_bins_up_to_nyquist,)  # Change for non-real FFT
+        sstshape = (channels, num_bins_up_to_nyquist)   # Could change for complex full FFT, but not relevant to SST.
 
         wft = self.wft(f, window, fftsize)
         wft_plus = self.wft(f_plus, window, fftsize)
@@ -250,9 +254,14 @@ class TFTransformer(object):
         wft[out_of_bounds] = 0
         rf[out_of_bounds] = 0
         sst_out = np.zeros(sstshape, dtype=(complex if reassignment_mode == "complex" else float))
-        # May need to change the line below for non-real FFT for reconstruction???  I don't remember
-        np.add.at(sst_out, (rf * sstsize).astype(int), self._reassignment_value_map(wft, reassignment_mode))
+
+        for channel in range(channels):
+            np.add.at(sst_out[channel], (rf[channel] * sstsize).astype(int),
+                      self._reassignment_value_map(wft[channel], reassignment_mode))
         return sst_out
+
+    def _reassign_jtfrm(self, f: np.ndarray, window: np.ndarray, fftsize: int, sstsize: int, reassignment_mode):
+        pass
 
     @staticmethod
     def _pad_boundary_rows(input_array: np.ndarray, finalsize: int, side: str) -> np.ndarray:
@@ -266,7 +275,7 @@ class TFTransformer(object):
                      i.e., if "left", then padding is done to the left of the input array.
         :return: output_array: reflection-padded array
         """
-        inputsize = input_array.shape[0]
+        inputsize = input_array.shape[1]
         if finalsize == inputsize:
             return input_array
         else:
@@ -282,12 +291,10 @@ class TFTransformer(object):
                                  "must be 'left' or 'right'".format(side))
 
             if len(input_array.shape) == 2:
-                output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='reflect')
-            elif len(input_array.shape) == 1:
-                output_array = np.pad(input_array, (padsize_left, padsize_right), mode='reflect')
+                output_array = np.pad(input_array, ((0, 0), (padsize_left, padsize_right)), mode='reflect')
             else:
                 raise ValueError("input array to pad_boundary_rows has dimensions {}, "
-                                 "which is not supported".format(input_array.shape))
+                                 "which is not supported... must be 2D array even if mono".format(input_array.shape))
 
             return output_array
 
@@ -303,7 +310,7 @@ class TFTransformer(object):
         :param finalsize: final size of the array (example: FFT size)
         :return: output_array: zero-padded array
         """
-        inputsize = input_array.shape[0]
+        inputsize = input_array.shape[1]
         if inputsize == finalsize:
             return input_array
         else:
@@ -312,11 +319,9 @@ class TFTransformer(object):
             padsize_right = padsize - padsize_left
 
             if len(input_array.shape) == 2:
-                output_array = np.pad(input_array, ((padsize_left, padsize_right), (0, 0)), mode='constant')
-            elif len(input_array.shape) == 1:
-                output_array = np.pad(input_array, (padsize_left, padsize_right), mode='constant')
+                output_array = np.pad(input_array, ((0, 0), (padsize_left, padsize_right)), mode='constant')
             else:
                 raise ValueError("input array to zeropad_rows has dimensions {}, "
-                                 "which is not supported".format(input_array.shape))
+                                 "which is not supported... must be 2D array even if mono".format(input_array.shape))
 
             return output_array
