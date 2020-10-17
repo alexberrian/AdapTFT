@@ -11,8 +11,10 @@ class TFTransformer(object):
     def __init__(self, filename):
         self.AudioSignal = AudioSignal(filename)
         self.param_dict = {}
+        self.exp_time_shift = None
 
         self.initialize_default_params()
+        self.initialize_helper_arrays()
 
     def initialize_default_params(self):
         self.param_dict = {"hopsize":                       256,  # Test with 215
@@ -30,6 +32,11 @@ class TFTransformer(object):
                            "eps_division":              1.0e-16,
                            "reassignment_mode":         "magsq",  # "magsq" or "complex"
                           }
+
+    def initialize_helper_arrays(self):
+        self.exp_time_shift = np.exp(-TWOPI * 1j * np.tile(np.arange(self.param_dict["fftsize"]),
+                                                           [self.AudioSignal.channels, 1])
+                                     / float(self.AudioSignal.samplerate))
 
     def compute_stft(self):
         """
@@ -232,7 +239,7 @@ class TFTransformer(object):
                              "or 'complex_full'".format(fft_type))
 
     @staticmethod
-    def _reassignment_value_map(x: np.ndarray, reassignment_mode: str):
+    def _reassignment_value_map(x: np.ndarray, reassignment_mode: str) -> np.ndarray:
         if reassignment_mode == "magsq":
             return np.abs(x) ** 2.0
         elif reassignment_mode == "complex":
@@ -241,27 +248,61 @@ class TFTransformer(object):
             raise ValueError("Invalid reassignment_mode {}".format(reassignment_mode))
 
     def _reassign_sst(self, f: np.ndarray, f_plus: np.ndarray, window: np.ndarray,
-                      fftsize: int, sstsize: int, reassignment_mode: str):
-        eps_division = self.param_dict["eps_division"]
+                      fftsize: int, sstsize: int, reassignment_mode: str) -> np.ndarray:
         channels = self.AudioSignal.channels
         num_bins_up_to_nyquist = (sstsize // 2) + 1
-        sstshape = (channels, num_bins_up_to_nyquist)   # Could change for complex full FFT, but not relevant to SST.
+        sst_shape = (channels, num_bins_up_to_nyquist)  # Bins above Nyquist generally irrelevant for SST purposes
 
         wft = self.wft(f, window, fftsize)
         wft_plus = self.wft(f_plus, window, fftsize)
-        rf = np.angle(wft_plus / (wft + eps_division)) / TWOPI  # Unit: Normalized frequency
+        rf = self._calculate_rf(wft, wft_plus)  # Unit: Normalized frequency
         out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
         wft[out_of_bounds] = 0
         rf[out_of_bounds] = 0
-        sst_out = np.zeros(sstshape, dtype=(complex if reassignment_mode == "complex" else float))
+        sst_out = np.zeros(sst_shape, dtype=(complex if reassignment_mode == "complex" else float))
 
         for channel in range(channels):
             np.add.at(sst_out[channel], (rf[channel] * sstsize).astype(int),
                       self._reassignment_value_map(wft[channel], reassignment_mode))
         return sst_out
 
-    def _reassign_jtfrm(self, f: np.ndarray, window: np.ndarray, fftsize: int, sstsize: int, reassignment_mode):
-        pass
+    def _reassign_jtfrm(self, f: np.ndarray, f_plus: np.ndarray, window: np.ndarray,
+                        fftsize: int, sstsize: int, reassignment_mode) -> np.ndarray:
+        channels = self.AudioSignal.channels
+        num_bins_up_to_nyquist = (sstsize // 2) + 1
+        jtfrm_shape = (channels, num_bins_up_to_nyquist)  # Bins above Nyquist generally irrelevant for JTFRM purposes
+
+        wft = self.wft(f, window, fftsize)
+        wft_plus_freq = self.wft(f_plus, window, fftsize)
+        # WARNING: For JTFRM based on QSTFT with multiple FFT sizes, OR FFT size changed by user,
+        # the line below will need to be modified.
+        try:
+            f_plus_time = f * self.exp_time_shift[:, :fftsize]  # See warning above
+        except IndexError:
+            raise IndexError("self.exp_time_shift has dimensions {}, "
+                             "but FFT size passed here is {}".format(self.exp_time_shift.shape, fftsize))
+        wft_plus_time = self.wft(f_plus_time, window, fftsize, fft_type="complex_short")
+        # This is way less trivial because you need to decide a buffer of time
+        # where the reassignment could happen over frames.
+        # This SHOULD ideally be based in theory.
+
+        rf = self._calculate_rf(wft, wft_plus_freq)  # Unit: Normalized frequency
+        out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
+        wft[out_of_bounds] = 0
+        rf[out_of_bounds] = 0
+        jtfrm_out = np.zeros(jtfrm_shape, dtype=(complex if reassignment_mode == "complex" else float))
+
+        for channel in range(channels):
+            np.add.at(jtfrm_out[channel], (rf[channel] * sstsize).astype(int),
+                      self._reassignment_value_map(wft[channel], reassignment_mode))
+        return jtfrm_out
+
+    def _calculate_rf(self, wft: np.ndarray, wft_plus: np.ndarray) -> np.ndarray:
+        eps_division = self.param_dict["eps_division"]
+        return np.angle(wft_plus / (wft + eps_division)) / TWOPI  # Unit: Normalized frequency
+
+    def _calculate_rt(self, wft: np.ndarray, wft_plus: np.ndarray):
+        return
 
     @staticmethod
     def _pad_boundary_rows(input_array: np.ndarray, finalsize: int, side: str) -> np.ndarray:
