@@ -13,10 +13,10 @@ class TFTransformer(object):
         self.param_dict = {}
         self.exp_time_shift = None
 
-        self.initialize_default_params()
-        self.initialize_helper_arrays()
+        self._initialize_default_params()
+        self._initialize_helper_arrays()
 
-    def initialize_default_params(self):
+    def _initialize_default_params(self):
         self.param_dict = {"hopsize":                       256,  # Test with 215
                            "windowfunc":             np.hanning,
                            "windowmode":               "single",
@@ -33,10 +33,48 @@ class TFTransformer(object):
                            "reassignment_mode":         "magsq",  # "magsq" or "complex"
                           }
 
-    def initialize_helper_arrays(self):
+    def _initialize_helper_arrays(self):
         self.exp_time_shift = np.exp(-TWOPI * 1j * np.tile(np.arange(self.param_dict["fftsize"]),
                                                            [self.AudioSignal.channels, 1])
                                      / float(self.AudioSignal.samplerate))
+
+    def _check_parameter_validity(self, transform):
+        windowmode = self.param_dict["windowmode"]
+        windowsize = self.param_dict["windowsize"]
+        hopsize = self.param_dict["hopsize"]
+        fftsize = self.param_dict["fftsize"]
+        buffermode = self.param_dict["buffermode"]
+        reassignment_mode = self.param_dict["reassignment_mode"]
+
+        # Validity checks for all transforms
+        if hopsize > windowsize:
+            raise ValueError("Not allowed to have hopsize {} larger than windowsize {} "
+                             "because of the way SoundFile processes chunks".format(hopsize, windowsize))
+        if windowsize > fftsize:
+            raise ValueError("window size {} is larger than FFT size {}!".format(windowsize, fftsize))
+        if buffermode not in ["centered_analysis", "reconstruction", "valid_analysis"]:
+            raise ValueError("Invalid buffermode {}".format(buffermode))
+        elif buffermode == "reconstruction":
+            raise ValueError("Buffermode 'reconstruction' is not yet implemented")
+
+        # Transform-specific checks
+        if transform == "stft":
+            if windowmode != "single":
+                raise ValueError("windowmode must be 'single' for STFT, "
+                                 "instead it is {}".format(windowmode))
+            if windowsize < 2:
+                raise ValueError("windowsize {} must be at least 2 for STFT".format(windowsize))
+        elif transform == "sst":
+            if not self.param_dict["realfft"]:
+                raise ValueError("Must have realfft to compute SST, untested otherwise!")
+            if windowmode != "single":
+                raise ValueError("windowmode (currently) must be 'single' for SST, "
+                                 "instead it is {}. "
+                                 "Will support SST based on QSTFT later.".format(windowmode))
+            if windowsize < 4:
+                raise ValueError("windowsize {} must be at least 4 to deal with edge cases for SST".format(windowsize))
+            if reassignment_mode not in ["magsq", "complex"]:
+                raise ValueError("Invalid reassignment mode {}".format(reassignment_mode))
 
     def compute_stft(self):
         """
@@ -50,17 +88,11 @@ class TFTransformer(object):
 
         :yield: Generator, each instance is an STFT frame.
         """
-        windowmode = self.param_dict["windowmode"]
-        if windowmode != "single":
-            raise ValueError("windowmode must be 'single' for STFT, "
-                             "instead it is {}".format(windowmode))
+        self._check_parameter_validity("stft")
+
         hopsize = self.param_dict["hopsize"]
         windowsize = self.param_dict["windowsize"]
-        if windowsize < 2:
-            raise ValueError("windowsize {} must be at least 2".format(windowsize))
         fftsize = self.param_dict["fftsize"]
-        if windowsize > fftsize:
-            raise ValueError("window size {} is larger than FFT size {}!".format(windowsize, fftsize))
         windowfunc = self.param_dict["windowfunc"]
         buffermode = self.param_dict["buffermode"]
         overlap = windowsize - hopsize
@@ -135,25 +167,17 @@ class TFTransformer(object):
         - Deal with mono vs. stereo etc.
         :yield: synchrosqueezing transform of the given STFT frame
         """
-        if not self.param_dict["realfft"]:
-            raise ValueError("Must have realfft to compute SST, untested otherwise!")
-        windowmode = self.param_dict["windowmode"]
-        if windowmode != "single":
-            raise ValueError("windowmode (currently) must be 'single' for SST, "
-                             "instead it is {}. "
-                             "Will support SST based on QSTFT later.".format(windowmode))
+        self._check_parameter_validity("sst")
+
+        # windowmode = self.param_dict["windowmode"]
         hopsize = self.param_dict["hopsize"]
         windowsize = self.param_dict["windowsize"]
-        if windowsize < 4:
-            raise ValueError("windowsize {} must be at least 4 to deal with edge cases for SST".format(windowsize))
-        windowsize_p1 = windowsize + 1
         fftsize = self.param_dict["fftsize"]
-        if windowsize > fftsize:
-            raise ValueError("window size {} is larger than FFT size {}!".format(windowsize, fftsize))
         sstsize = self.param_dict["sstsize"]
         windowfunc = self.param_dict["windowfunc"]
         buffermode = self.param_dict["buffermode"]
-        overlap = (windowsize + 1) - hopsize  # For SST block procedure
+        windowsize_p1 = windowsize + 1
+        overlap = windowsize_p1 - hopsize  # For SST block procedure
         window = windowfunc(windowsize)
         reassignment_mode = self.param_dict["reassignment_mode"]
 
@@ -282,9 +306,6 @@ class TFTransformer(object):
             raise IndexError("self.exp_time_shift has dimensions {}, "
                              "but FFT size passed here is {}".format(self.exp_time_shift.shape, fftsize))
         wft_plus_time = self.wft(f_plus_time, window, fftsize, fft_type="complex_short")
-        # This is way less trivial because you need to decide a buffer of time
-        # where the reassignment could happen over frames.
-        # This SHOULD ideally be based in theory.
 
         rf = self._calculate_rf(wft, wft_plus_freq)  # Unit: Normalized frequency
         out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
