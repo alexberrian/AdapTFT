@@ -1,5 +1,6 @@
 import numpy as np
 from audio_io import AudioSignal
+from copy import deepcopy
 # from typing import Callable
 # from typing import Generator
 
@@ -12,9 +13,11 @@ class TFTransformer(object):
         self.AudioSignal = AudioSignal(filename)
         self.param_dict = {}
         self.exp_time_shift = None
+        self.jtfrt_memory = None
+        self.jtfrt_shape = None
 
         self._initialize_default_params()
-        self._initialize_helper_arrays()
+        self._initialize_helpers_jtfrt()
 
     def _initialize_default_params(self):
         self.param_dict = {"hopsize":                       256,  # Test with 215
@@ -33,10 +36,25 @@ class TFTransformer(object):
                            "reassignment_mode":         "magsq",  # "magsq" or "complex"
                           }
 
-    def _initialize_helper_arrays(self):
+    def _initialize_helpers_jtfrt(self):
+        """
+        Initialize helper arrays and variables for JTFRT
+        :return:
+        """
+        windowsize = self.param_dict["windowsize"]
+        hopsize = self.param_dict["hopsize"]
+        sstsize = self.param_dict["sstsize"]
+        reassignment_mode = self.param_dict["reassignment_mode"]
+        reassignment_dtype: type = complex if reassignment_mode == "complex" else float
+
         self.exp_time_shift = np.exp(-TWOPI * 1j * np.tile(np.arange(self.param_dict["fftsize"]),
                                                            [self.AudioSignal.channels, 1])
                                      / float(self.AudioSignal.samplerate))
+        jtfrt_memory_num_frames = windowsize // hopsize
+        channels = self.AudioSignal.channels
+        num_bins_up_to_nyquist = (sstsize // 2) + 1
+        self.jtfrt_shape = (channels, num_bins_up_to_nyquist)
+        self.jtfrt_memory = np.zeros([jtfrt_memory_num_frames, *self.jtfrt_shape], dtype=reassignment_dtype)
 
     def _check_parameter_validity(self, transform):
         windowmode = self.param_dict["windowmode"]
@@ -64,17 +82,20 @@ class TFTransformer(object):
                                  "instead it is {}".format(windowmode))
             if windowsize < 2:
                 raise ValueError("windowsize {} must be at least 2 for STFT".format(windowsize))
-        elif transform == "sst":
+        elif transform in ["sst", "jtfrt"]:
             if not self.param_dict["realfft"]:
-                raise ValueError("Must have realfft to compute SST, untested otherwise!")
+                raise ValueError("Must have realfft to compute SST/JTFRT, untested otherwise!")
             if windowmode != "single":
-                raise ValueError("windowmode (currently) must be 'single' for SST, "
+                raise ValueError("windowmode (currently) must be 'single' for SST/JTFRT, "
                                  "instead it is {}. "
-                                 "Will support SST based on QSTFT later.".format(windowmode))
+                                 "Will support SST/JTFRT based on QSTFT later.".format(windowmode))
             if windowsize < 4:
-                raise ValueError("windowsize {} must be at least 4 to deal with edge cases for SST".format(windowsize))
+                raise ValueError("windowsize {} must be at least 4 to deal with edge cases "
+                                 "for SST/JTFRT".format(windowsize))
             if reassignment_mode not in ["magsq", "complex"]:
                 raise ValueError("Invalid reassignment mode {}".format(reassignment_mode))
+        else:
+            raise ValueError("Invalid transform {}".format(transform))
 
     def compute_stft(self):
         """
@@ -97,6 +118,9 @@ class TFTransformer(object):
         buffermode = self.param_dict["buffermode"]
         overlap = windowsize - hopsize
         window = windowfunc(windowsize)
+
+        # Just in case the audio signal has already been read out
+        self.AudioSignal.seek(frames=0)
 
         # Compute the left boundary STFT frames
         # Will refactor later when I put in the "reconstruction" buffering mode.
@@ -165,11 +189,12 @@ class TFTransformer(object):
         TO DO:
         - Investigate the non-realfft case
         - Deal with mono vs. stereo etc.
+        - Deal with QSTFT case
         :yield: synchrosqueezing transform of the given STFT frame
         """
         self._check_parameter_validity("sst")
 
-        # windowmode = self.param_dict["windowmode"]
+        # windowmode = self.param_dict["windowmode"]  # For later development
         hopsize = self.param_dict["hopsize"]
         windowsize = self.param_dict["windowsize"]
         fftsize = self.param_dict["fftsize"]
@@ -181,12 +206,15 @@ class TFTransformer(object):
         window = windowfunc(windowsize)
         reassignment_mode = self.param_dict["reassignment_mode"]
 
+        # Just in case the audio signal has already been read out
+        self.AudioSignal.seek(frames=0)
+
         # Compute the left boundary SST frames
         # Will refactor later when I put in the "reconstruction" buffering mode.
         if buffermode == "centered_analysis":
             initial_block = self.AudioSignal.read(frames=windowsize + 1, always_2d=True)
             initial_block = initial_block.T
-            # Pad the boundary with reflected audio frames, then yield the boundary STFT frames necessary
+            # Pad the boundary with reflected audio frames, then yield the boundary SST frames necessary
             frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
             while frame0 < 0:
                 reflect_block = self._pad_boundary_rows(initial_block[:, :(frame0 + windowsize)], windowsize, 'left')
@@ -234,7 +262,7 @@ class TFTransformer(object):
                 raise ValueError("You shouldn't have final_block_num_frames {} "
                                  "greater than windowsize + 1 == {}".format(final_block_num_frames, windowsize_p1))
             # Pad the boundary with reflected audio frames,
-            # then add boundary STFT frames to the STFT
+            # then add boundary SST frames to the SST
             frame1 = 0
             halfwindowsize = (windowsize + 1) // 2   # Edge case: odd windows, want final valid sample to be in middle
             while final_block_num_frames - frame1 >= halfwindowsize:
@@ -250,6 +278,152 @@ class TFTransformer(object):
             pass
         else:
             raise ValueError("Invalid buffermode {}".format(buffermode))
+
+    def compute_jtfrt(self):
+        """
+        TO DO:
+        - Investigate the non-realfft case
+        - Deal with mono vs. stereo etc.
+        - Deal with QSTFT case
+        - Edge case: What happens at the right boundary? It's probably fine, but just check.
+        :yield: joint time-frequency reassignment transform of the given STFT frame
+        """
+        self._check_parameter_validity("jtfrt")
+        self._initialize_helpers_jtfrt()
+
+        # windowmode = self.param_dict["windowmode"]  # For later development
+        hopsize = self.param_dict["hopsize"]
+        windowsize = self.param_dict["windowsize"]
+        fftsize = self.param_dict["fftsize"]
+        sstsize = self.param_dict["sstsize"]  # i.e., size of frequency axis.  No option to change time axis yet
+        windowfunc = self.param_dict["windowfunc"]
+        buffermode = self.param_dict["buffermode"]
+        windowsize_p1 = windowsize + 1
+        overlap = windowsize_p1 - hopsize  # For JTFRT block procedure
+        window = windowfunc(windowsize)
+        reassignment_mode = self.param_dict["reassignment_mode"]
+        reassignment_dtype: type = complex if reassignment_mode == "complex" else float
+
+        # Create a circular buffer of JTFRT frames of size windowsize // hopsize,
+        # This may not be enough if windowsize not divided evenly by hopsize, but forget that edge case
+        jtfrt_memory_num_frames = windowsize // hopsize
+        write_frame = 0
+        export_frame = -(jtfrt_memory_num_frames // 2) + 1
+
+        # Just in case the audio signal has already been read out
+        self.AudioSignal.seek(frames=0)
+
+        # Compute the left boundary JTFRT frames
+        # Will refactor later when I put in the "reconstruction" buffering mode.
+        if buffermode == "centered_analysis":
+            initial_block = self.AudioSignal.read(frames=windowsize + 1, always_2d=True)
+            initial_block = initial_block.T
+            # Pad the boundary with reflected audio frames, then yield the boundary JTFRT frames necessary
+            frame0 = -(windowsize // 2)  # if window is odd, this centers audio frame 0. reconstruction imperfect
+            while frame0 < 0:
+                reflect_block = self._pad_boundary_rows(initial_block[:, :(frame0 + windowsize)], windowsize, 'left')
+                reflect_block_plus = self._pad_boundary_rows(initial_block[:, :(frame0 + windowsize_p1)],
+                                                             windowsize, 'left')
+                self._reassign_jtfrt(write_frame, reflect_block, reflect_block_plus, window,
+                                     fftsize, sstsize, reassignment_mode)
+                frame0 += hopsize
+                write_frame += 1
+                write_frame %= jtfrt_memory_num_frames
+                if export_frame > -1:
+                    # Export and reset this frame to zeros so it can be added to again
+                    # You HAVE to yield a deepcopy or else it will yield a pointer to the memory array.
+                    yield deepcopy(self.jtfrt_memory[export_frame])
+                    self.jtfrt_memory[export_frame] *= 0
+                    export_frame += 1
+                    export_frame %= jtfrt_memory_num_frames
+                else:
+                    export_frame += 1
+
+        elif buffermode == "reconstruction":
+            pass  # FILL THIS IN
+            frame0 = 0
+        elif buffermode == "valid_analysis":
+            frame0 = 0
+        else:
+            raise ValueError("Invalid buffermode {}".format(buffermode))
+
+        # May refactor the following four non-comment code lines for full generality
+        # Get the number of audio frames, and seek to the audio frame given by frame0
+        num_audio_frames = self.AudioSignal.get_num_frames_from_and_seek_start(start_frame=frame0)
+
+        # Now calculate the max number of FULL non-boundary JTFRT frames,
+        # considering hop size and window size.  Have to modify because taking more frames than usual.
+        num_full_jtfrt_frames = 1 + ((num_audio_frames - windowsize_p1) // hopsize)
+
+        # Convert that to the number of audio frames that you'll analyze for non-boundary JTFRT.
+        num_audio_frames_full_jtfrt = (num_full_jtfrt_frames - 1) * hopsize + windowsize_p1
+
+        # Feed blocks to create the non-boundary JTFRT frames, with
+        blockreader = self.AudioSignal.blocks(blocksize=windowsize_p1, overlap=overlap,
+                                              frames=num_audio_frames_full_jtfrt, always_2d=True)
+        for block in blockreader:
+            block = block.T  # First transpose to get each channel as a row
+            self._reassign_jtfrt(write_frame, block[:, :windowsize], block[:, 1:],
+                                 window, fftsize, sstsize, reassignment_mode)
+            frame0 += hopsize
+            write_frame += 1
+            write_frame %= jtfrt_memory_num_frames
+            if export_frame > -1:
+                # Export and reset this frame to zeros so it can be added to again
+                # You HAVE to yield a deepcopy or else it will yield a pointer to the memory array.
+                yield deepcopy(self.jtfrt_memory[export_frame])
+                self.jtfrt_memory[export_frame] *= 0
+                export_frame += 1
+                export_frame %= jtfrt_memory_num_frames
+            else:
+                export_frame += 1
+
+        # Compute the right boundary JTFRT frames
+        if buffermode == "centered_analysis":
+            # Need to read from frame0
+            self.AudioSignal.seek(frames=frame0)
+            # Read the rest of the file (length less than windowsize+1)
+            final_block = self.AudioSignal.read(always_2d=True)
+            final_block = final_block.T
+            final_block_num_frames = final_block.shape[1]
+            if final_block_num_frames >= windowsize_p1:
+                raise ValueError("You shouldn't have final_block_num_frames {} "
+                                 "greater than windowsize + 1 == {}".format(final_block_num_frames, windowsize_p1))
+            # Pad the boundary with reflected audio frames,
+            # then add boundary JTFRT frames to the JTFRT
+            frame1 = 0
+            halfwindowsize = (windowsize + 1) // 2  # Edge case: odd windows, want final valid sample to be in middle
+            while final_block_num_frames - frame1 >= halfwindowsize:
+                reflect_block = self._pad_boundary_rows(final_block[:, frame1:], windowsize, 'right')
+                reflect_block_plus = self._pad_boundary_rows(final_block[:, frame1 + 1:(frame1 + windowsize_p1)],
+                                                             windowsize, 'right')
+                self._reassign_jtfrt(write_frame, reflect_block, reflect_block_plus, window,
+                                     fftsize, sstsize, reassignment_mode)
+                frame1 += hopsize
+                write_frame += 1
+                write_frame %= jtfrt_memory_num_frames
+                if export_frame > -1:
+                    # Export and reset this frame to zeros so it can be added to again
+                    # You HAVE to yield a deepcopy or else it will yield a pointer to the memory array.
+                    yield deepcopy(self.jtfrt_memory[export_frame])
+                    self.jtfrt_memory[export_frame] *= 0
+                    export_frame += 1
+                    export_frame %= jtfrt_memory_num_frames
+                else:
+                    export_frame += 1
+        elif buffermode == "reconstruction":
+            pass  # FILL THIS IN
+        elif buffermode == "valid_analysis":  # Do nothing at this point
+            pass
+        else:
+            raise ValueError("Invalid buffermode {}".format(buffermode))
+
+        # Flush the remaining buffers
+        # No need to zero them out
+        while export_frame != write_frame:
+            yield deepcopy(self.jtfrt_memory[export_frame])
+            export_frame += 1
+            export_frame %= jtfrt_memory_num_frames
 
     def wft(self, block: np.ndarray, window: np.ndarray, fftsize: int, fft_type="real") -> np.ndarray:
         if fft_type == "real":
@@ -290,11 +464,13 @@ class TFTransformer(object):
                       self._reassignment_value_map(wft[channel], reassignment_mode))
         return sst_out
 
-    def _reassign_jtfrm(self, f: np.ndarray, f_plus: np.ndarray, window: np.ndarray,
-                        fftsize: int, sstsize: int, reassignment_mode) -> np.ndarray:
+    def _reassign_jtfrt(self, write_frame: int, f: np.ndarray, f_plus: np.ndarray,
+                        window: np.ndarray, fftsize: int, sstsize: int, reassignment_mode: str):
+        jtfrt_memory_num_frames = self.jtfrt_memory.shape[0]
+        jtfrt_memory_num_frames_half = jtfrt_memory_num_frames // 2
+        jtfrt_frames_back = jtfrt_memory_num_frames_half - 1
+        jtfrt_frames_front = jtfrt_memory_num_frames_half
         channels = self.AudioSignal.channels
-        num_bins_up_to_nyquist = (sstsize // 2) + 1
-        jtfrm_shape = (channels, num_bins_up_to_nyquist)  # Bins above Nyquist generally irrelevant for JTFRM purposes
 
         wft = self.wft(f, window, fftsize)
         wft_plus_freq = self.wft(f_plus, window, fftsize)
@@ -308,22 +484,33 @@ class TFTransformer(object):
         wft_plus_time = self.wft(f_plus_time, window, fftsize, fft_type="complex_short")
 
         rf = self._calculate_rf(wft, wft_plus_freq)  # Unit: Normalized frequency
-        out_of_bounds = np.where((rf < 0) | (rf > 0.5))  # For real valued signals rf > 0.5 is meaningless
+        rtdev = self._calculate_rtdev(wft, wft_plus_time)
+        rtdev = np.zeros(rtdev.shape, dtype=rtdev.dtype)  # For debug, see if it works like SST does
+        out_of_bounds = np.where((rf < 0) | (rf > 0.5) | (rtdev > jtfrt_frames_back) | (rtdev < -jtfrt_frames_front))
         wft[out_of_bounds] = 0
         rf[out_of_bounds] = 0
-        jtfrm_out = np.zeros(jtfrm_shape, dtype=(complex if reassignment_mode == "complex" else float))
+
+        # Change rf, rt to the appropriate location indices
+        rf = (rf * sstsize).astype(int)
+        rt = (np.round(write_frame - rtdev) % jtfrt_memory_num_frames).astype(int)  # % because memory array is circular
+        rt[out_of_bounds] = 0
 
         for channel in range(channels):
-            np.add.at(jtfrm_out[channel], (rf[channel] * sstsize).astype(int),
+            np.add.at(self.jtfrt_memory[:, channel, :], (rt[channel], rf[channel]),
                       self._reassignment_value_map(wft[channel], reassignment_mode))
-        return jtfrm_out
 
     def _calculate_rf(self, wft: np.ndarray, wft_plus: np.ndarray) -> np.ndarray:
         eps_division = self.param_dict["eps_division"]
         return np.angle(wft_plus / (wft + eps_division)) / TWOPI  # Unit: Normalized frequency
 
-    def _calculate_rt(self, wft: np.ndarray, wft_plus: np.ndarray):
-        return
+    def _calculate_rtdev(self, wft: np.ndarray, wft_plus: np.ndarray):
+        eps_division = self.param_dict["eps_division"]
+        hopsize = self.param_dict["hopsize"]
+        windowsize = self.param_dict["windowsize"]
+        samplerate = self.AudioSignal.samplerate
+
+        # Returned unit is in STFT frames from the center, current frame.
+        return np.angle(wft_plus / (wft + eps_division)) / TWOPI / hopsize * samplerate + windowsize/2/hopsize
 
     @staticmethod
     def _pad_boundary_rows(input_array: np.ndarray, finalsize: int, side: str) -> np.ndarray:
