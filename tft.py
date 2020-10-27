@@ -333,7 +333,7 @@ class TFTransformer(object):
                     # Export and reset this frame to zeros so it can be added to again
                     # You HAVE to yield a deepcopy or else it will yield a pointer to the memory array.
                     yield deepcopy(self.jtfrt_memory[export_frame])
-                    self.jtfrt_memory[export_frame] *= 0
+                    self.jtfrt_memory[export_frame] = 0
                     export_frame += 1
                     export_frame %= jtfrt_memory_num_frames
                 else:
@@ -372,7 +372,7 @@ class TFTransformer(object):
                 # Export and reset this frame to zeros so it can be added to again
                 # You HAVE to yield a deepcopy or else it will yield a pointer to the memory array.
                 yield deepcopy(self.jtfrt_memory[export_frame])
-                self.jtfrt_memory[export_frame] *= 0
+                self.jtfrt_memory[export_frame] = 0
                 export_frame += 1
                 export_frame %= jtfrt_memory_num_frames
             else:
@@ -406,7 +406,7 @@ class TFTransformer(object):
                     # Export and reset this frame to zeros so it can be added to again
                     # You HAVE to yield a deepcopy or else it will yield a pointer to the memory array.
                     yield deepcopy(self.jtfrt_memory[export_frame])
-                    self.jtfrt_memory[export_frame] *= 0
+                    self.jtfrt_memory[export_frame] = 0
                     export_frame += 1
                     export_frame %= jtfrt_memory_num_frames
                 else:
