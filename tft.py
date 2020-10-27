@@ -411,13 +411,19 @@ class TFTransformer(object):
                     export_frame %= jtfrt_memory_num_frames
                 else:
                     export_frame += 1
-        # TODO: NEED TO FLUSH THE REMAINING BUFFERS!!! ( = 1 less than the total size)
         elif buffermode == "reconstruction":
             pass  # FILL THIS IN
         elif buffermode == "valid_analysis":  # Do nothing at this point
             pass
         else:
             raise ValueError("Invalid buffermode {}".format(buffermode))
+
+        # Flush the remaining buffers
+        # No need to zero them out
+        while export_frame != write_frame:
+            yield deepcopy(self.jtfrt_memory[export_frame])
+            export_frame += 1
+            export_frame %= jtfrt_memory_num_frames
 
     def wft(self, block: np.ndarray, window: np.ndarray, fftsize: int, fft_type="real") -> np.ndarray:
         if fft_type == "real":
