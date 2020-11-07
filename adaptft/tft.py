@@ -1,5 +1,5 @@
 import numpy as np
-from audio_io import AudioSignal
+from adaptft.audio_io import AudioSignal
 from copy import deepcopy
 # from typing import Callable
 # from typing import Generator
