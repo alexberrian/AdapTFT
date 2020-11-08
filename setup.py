@@ -3,7 +3,7 @@ import setuptools
 with open("README.md", "r") as fh:
     long_description = fh.read()
 
-setuptools.setup(name='AdapTFT-aberrian',
+setuptools.setup(name='AdapTFT-alexberrian',
      version='0.0.0',
      description='Adaptive time-frequency transformations and reassignment transforms',
      long_description=long_description,
