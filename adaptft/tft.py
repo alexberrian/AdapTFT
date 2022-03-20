@@ -3,6 +3,7 @@ from adaptft.audio_io import AudioSignal
 from copy import deepcopy
 # from typing import Callable
 # from typing import Generator
+from utils import CircularBuffer
 
 TWOPI = np.pi * 2
 
@@ -95,7 +96,7 @@ class TFTransformer(object):
             if reassignment_mode not in ["magsq", "complex"]:
                 raise ValueError("Invalid reassignment mode {}".format(reassignment_mode))
         else:
-            raise ValueError("Invalid transform {}".format(transform))
+            raise ValueError("Invalid or unsupported transform {}".format(transform))
 
     def compute_stft(self):
         """
@@ -425,16 +426,92 @@ class TFTransformer(object):
             export_frame += 1
             export_frame %= jtfrt_memory_num_frames
 
-    def wft(self, block: np.ndarray, window: np.ndarray, fftsize: int, fft_type="real") -> np.ndarray:
+    def compute_qstft(self):
+        # How do we do the block procedure appropriately when there is this inconvenient -1?
+        WARCR_BUFFER_SIZE = 3  # This is customizable as the "A" variable but just setting this for simplicity
+        self._check_parameter_validity("qstft")
+        warcr_buffer = CircularBuffer(WARCR_BUFFER_SIZE)
+
+        hopsize = self.param_dict["hopsize"]
+        windowsize = self.param_dict["windowsize"]
+        fftsize = self.param_dict["fftsize"]
+        sstsize = self.param_dict["sstsize"]
+        windowfunc = self.param_dict["windowfunc"]
+        buffermode = self.param_dict["buffermode"]
+        windowsize_p2 = windowsize + 2
+        overlap = windowsize_p2 - hopsize  # For QSTFT block procedure
+        window = windowfunc(windowsize)
+        reassignment_mode = self.param_dict["reassignment_mode"]
+
+        # Just in case the audio signal has already been read out
+        self.AudioSignal.seek(frames=0)
+
+        # Compute the left boundary frames.
+        # We get ONE MORE boundary frame because of the minus-one frame for computing RCR.
+        # Will refactor later when I put in the "reconstruction" buffering mode.
+        if buffermode == "centered_analysis":  # Start centered on frame 0
+            initial_block = self.AudioSignal.read(frames=windowsize + 2 + hopsize, always_2d=True)
+            initial_block = initial_block.T
+            # Pad the boundary with reflected audio frames, then yield the boundary frames necessary
+            frame0 = -(windowsize // 2)
+            while frame0 < 1:  # This allows us not to miss the final m1 boundary block.
+                reflect_block_m1 = self._pad_boundary_rows(initial_block[:, :(frame0 + windowsize - 1)],
+                                                           windowsize, 'left')
+                reflect_block_m0 = self._pad_boundary_rows(initial_block[:, :(frame0 + windowsize)],
+                                                           windowsize, 'left')
+                reflect_block_p1 = self._pad_boundary_rows(initial_block[:, :(frame0 + windowsize + 1)],
+                                                           windowsize, 'left')
+                reflect_block_p2 = self._pad_boundary_rows(initial_block[:, :(frame0 + windowsize + 2)],
+                                                           windowsize, 'left')
+                yield self._reassign_sst(reflect_block_m0, reflect_block_p1, window, fftsize, sstsize,
+                                         reassignment_mode)
+                frame0 += hopsize
+        elif buffermode == "reconstruction":
+            pass  # FILL THIS IN
+            frame0 = 0
+        elif buffermode == "valid_analysis":
+            frame0 = 0
+        else:
+            raise ValueError("Invalid buffermode {}".format(buffermode))
+
+        # May refactor the following four non-comment code lines for full generality
+        # Get the number of audio frames, and seek to the audio frame given by frame0
+        num_audio_frames = self.AudioSignal.get_num_frames_from_and_seek_start(start_frame=frame0)
+
+        # Now calculate the max number of FULL non-boundary SST frames,
+        # considering hop size and window size.  Have to modify because taking more frames than usual.
+        num_full_sst_frames = 1 + ((num_audio_frames - windowsize_p1) // hopsize)
+
+        # Convert that to the number of audio frames that you'll analyze for non-boundary SST.
+        num_audio_frames_full_sst = (num_full_sst_frames - 1) * hopsize + windowsize_p1
+
+        # Feed blocks to create the non-boundary QSTFT frames.
+        # Note that this procedure needs to dramatically change to account for the left boundary condition here.
+        blockreader = self.AudioSignal.blocks(blocksize=windowsize_p1, overlap=overlap,
+                                              frames=num_audio_frames_full_sst, always_2d=True)
+
+    def wft(self, block: np.ndarray, window: np.ndarray, fftsize: int, fft_type="real",
+                  freqshift: int = 0) -> np.ndarray:
+        if freqshift != 0:
+            if fft_type == "real":
+                raise ValueError("Cannot compute real-valued FFT if introducing frequency shift. "
+                                 "\nfreqshift = {}".format(freqshift))
         if fft_type == "real":
-            return np.fft.rfft(self._zeropad_rows(window * block, fftsize))
-        elif fft_type == "complex_short":
-            return np.fft.fft(self._zeropad_rows(window * block, fftsize))[:, :(1 + (fftsize // 2))]
-        elif fft_type == "complex_full":  # For reconstruction
-            return np.fft.fft(self._zeropad_rows(window * block, fftsize))
+            wft = np.fft.rfft(self._zeropad_rows(window * block, fftsize))
+        elif fft_type == "complex_short" or fft_type == "complex_full":
+            if freqshift != 0:
+                t = np.arange(fftsize)
+                multiplier = np.exp(-2.0 * np.pi * 1j * t * freqshift / self.AudioSignal.samplerate)
+                wft = np.fft.fft(self._zeropad_rows(window * block, fftsize) * multiplier)
+            else:
+                wft = np.fft.fft(self._zeropad_rows(window * block, fftsize))
+
+            if fft_type == "complex_short":
+                wft = wft[:, :(1 + (fftsize // 2))]
         else:
             raise ValueError("Invalid fft_type {}, must use 'real', 'complex_short', "
                              "or 'complex_full'".format(fft_type))
+        return wft
 
     @staticmethod
     def _reassignment_value_map(x: np.ndarray, reassignment_mode: str) -> np.ndarray:
@@ -444,6 +521,31 @@ class TFTransformer(object):
             return x
         else:
             raise ValueError("Invalid reassignment_mode {}".format(reassignment_mode))
+
+    def _compute_rcr(self, f_m1: np.ndarray, f_m0: np.ndarray, f_p1: np.ndarray, f_p2: np.ndarray, window: np.ndarray,
+                     fftsize: int) -> np.ndarray:
+        channels = self.AudioSignal.channels
+        num_bins_up_to_nyquist = (fftsize // 2) + 1
+        rcr_shape = (channels, num_bins_up_to_nyquist)  # Bins above Nyquist generally irrelevant for SST purposes
+
+        wft_tm1 = self.wft(f_m1, window, fftsize, fft_type="complex_short")
+        wft_tm0 = self.wft(f_m0, window, fftsize, fft_type="complex_short")
+        wft_tp1 = self.wft(f_p1, window, fftsize, fft_type="complex_short")
+        wft_tp2 = self.wft(f_p2, window, fftsize, fft_type="complex_short")
+        wft_tm1_fp1 = self.wft(f_m1, window, fftsize, fft_type="complex_short", freqshift=1)
+        wft_tp1_fp1 = self.wft(f_p1, window, fftsize, fft_type="complex_short", freqshift=1)
+
+        # TODO: Watch out for the multiplicative constants below.  They're different.
+        rf_plus = self._calculate_rf(wft_tp1, wft_tp2)
+        rf_minus = self._calculate_rf(wft_tm1, wft_tm0)
+        rtdev_front = self._calculate_rtdev(wft_tp1, wft_tp1_fp1)
+        rtdev_back = self._calculate_rtdev(wft_tm1, wft_tm1_fp1)
+
+
+
+
+
+
 
     def _reassign_sst(self, f: np.ndarray, f_plus: np.ndarray, window: np.ndarray,
                       fftsize: int, sstsize: int, reassignment_mode: str) -> np.ndarray:
@@ -511,6 +613,10 @@ class TFTransformer(object):
 
         # Returned unit is in STFT frames from the center, current frame.
         return np.angle(wft_plus / (wft + eps_division)) / TWOPI / hopsize * samplerate + windowsize/2/hopsize
+
+    @staticmethod
+    def _apply_freq_shift(input_array: np.ndarray, freqshift: float):
+        pass
 
     @staticmethod
     def _pad_boundary_rows(input_array: np.ndarray, finalsize: int, side: str) -> np.ndarray:
